@@ -15,7 +15,7 @@ jobs:
     steps:
       # 1. 检出代码（虽然本例不需要，但保留以备后续扩展）
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # 2. 安装构建工具
       - name: Install build tools
@@ -66,7 +66,7 @@ jobs:
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
 
-          # 配置 apt 源（使用国内镜像可加速，此处使用官方源）
+          # 配置 apt 源（使用官方源）
           sudo chroot "$ROOTFS_DIR" /bin/bash -c "
             echo 'deb http://deb.debian.org/debian bookworm main contrib non-free' > /etc/apt/sources.list
             echo 'deb http://deb.debian.org/debian bookworm-updates main contrib non-free' >> /etc/apt/sources.list
@@ -134,8 +134,10 @@ jobs:
 
       # 12. 上传为 GitHub Actions 产物
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: debian12-arm64-rootfs
           path: ${{ github.workspace }}/debian12-arm64-rootfs.tar.gz
           retention-days: 7
+
+          
