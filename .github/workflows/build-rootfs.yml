@@ -1,9 +1,9 @@
 name: Build Debian 12 ARM64 RootFS
 
 on:
-  # 手动触发
+  # 手动触发（推荐）
   workflow_dispatch:
-  # 推送到 main 分支时自动触发（可选）
+  # 可选：推送到 main 分支自动触发
   # push:
   #   branches:
   #     - main
@@ -13,11 +13,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. 检出代码
+      # 1. 检出代码（虽然不需要，但保留以备扩展）
       - name: Checkout code
         uses: actions/checkout@v5
 
-      # 2. 安装构建工具
+      # 2. 安装构建工具（debootstrap、QEMU 等）
       - name: Install build tools
         run: |
           sudo apt-get update
@@ -33,40 +33,56 @@ jobs:
           ls -la /proc/sys/fs/binfmt_misc/qemu-aarch64 || \
             sudo update-binfmts --enable qemu-aarch64
 
-      # 4. 创建 rootfs 目录并用 debootstrap 拉取基础系统
-      - name: Bootstrap Debian 12 ARM64 rootfs
+      # 4. 创建 rootfs 目录并执行第一阶段 debootstrap（只下载）
+      - name: Bootstrap Debian 12 ARM64 (stage 1)
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
           mkdir -p "$ROOTFS_DIR"
 
-          # 第一阶段：拉取基础包（--foreign 表示跨架构，只下载不解包）
           sudo debootstrap \
             --foreign \
             --verbose \
             --arch=arm64 \
+            --include=coreutils,bash,apt,openssh-server,systemd,systemd-sysv,sudo,curl,wget,vim-tiny,locales,net-tools,iproute2,dnsutils,ca-certificates \
             bookworm \
             "$ROOTFS_DIR" \
             http://deb.debian.org/debian/
 
-      # 5. 复制 QEMU 静态解释器到 rootfs 中
-      - name: Copy QEMU static binary to rootfs
+      # 5. 复制 QEMU 静态二进制到 rootfs（用于第二阶段模拟）
+      - name: Copy QEMU static binary
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
           sudo mkdir -p "$ROOTFS_DIR/usr/bin"
           sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS_DIR/usr/bin/"
 
-      # 6. 执行第二阶段配置（在 chroot 中用 QEMU 模拟运行）
-      - name: Second stage debootstrap (inside QEMU)
+      # 6. 执行第二阶段（在 chroot 内用 QEMU 完成安装）
+      - name: Second stage debootstrap
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
+          # 挂载必要的文件系统（确保 chroot 内可运行）
+          sudo mount --bind /dev "$ROOTFS_DIR/dev"
+          sudo mount --bind /dev/pts "$ROOTFS_DIR/dev/pts"
+          sudo mount -t proc proc "$ROOTFS_DIR/proc"
+          sudo mount -t sysfs sys "$ROOTFS_DIR/sys"
+          # 执行第二阶段
           sudo chroot "$ROOTFS_DIR" /debootstrap/debootstrap --second-stage
+          # 卸载挂载
+          sudo umount "$ROOTFS_DIR/dev/pts"
+          sudo umount "$ROOTFS_DIR/dev"
+          sudo umount "$ROOTFS_DIR/proc"
+          sudo umount "$ROOTFS_DIR/sys"
 
-      # 7. 基础配置：设置源、时区、语言环境等
+      # 7. 配置基础系统（源、时区、语言、DNS、SSH、root 密码）
       - name: Configure base system
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
 
-          # 配置 apt 源
+          # 挂载必要的虚拟文件系统（用于后续配置）
+          sudo mount --bind /dev "$ROOTFS_DIR/dev"
+          sudo mount -t proc proc "$ROOTFS_DIR/proc"
+          sudo mount -t sysfs sys "$ROOTFS_DIR/sys"
+
+          # 配置 apt 源（使用官方源，可替换为国内镜像）
           sudo chroot "$ROOTFS_DIR" /bin/bash -c "
             echo 'deb http://deb.debian.org/debian bookworm main contrib non-free' > /etc/apt/sources.list
             echo 'deb http://deb.debian.org/debian bookworm-updates main contrib non-free' >> /etc/apt/sources.list
@@ -89,65 +105,56 @@ jobs:
             update-locale LANG=en_US.UTF-8
           "
 
-      # 8. 安装常用基础包（包含 openssh-server）
-      - name: Install common packages
-        run: |
-          ROOTFS_DIR="${{ github.workspace }}/rootfs"
+          # 配置 DNS（直接写入 /etc/resolv.conf，确保 chroot 内可用）
           sudo chroot "$ROOTFS_DIR" /bin/bash -c "
-            apt-get update
-            apt-get install -y \
-              ca-certificates \
-              curl \
-              wget \
-              vim-tiny \
-              sudo \
-              systemd \
-              systemd-sysv \
-              network-manager \
-              ssh \
-              htop \
-              net-tools \
-              iproute2 \
-              dnsutils
-            apt-get clean
-            rm -rf /var/lib/apt/lists/*
+            echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+            echo 'nameserver 1.1.1.1' >> /etc/resolv.conf
           "
 
-      # 9. 设置 root 密码
-      - name: Set root password
-        run: |
-          ROOTFS_DIR="${{ github.workspace }}/rootfs"
-          sudo chroot "$ROOTFS_DIR" /bin/bash -c "echo 'root:root' | chpasswd"
-
-      # ========== 新增步骤：开启 SSH Root 密码登录 ==========
-      - name: Enable SSH root password login
-        run: |
-          ROOTFS_DIR="${{ github.workspace }}/rootfs"
+          # 开启 SSH root 密码登录
           sudo chroot "$ROOTFS_DIR" /bin/bash -c "
-            # 修改 sshd_config，允许 root 通过密码登录
             sed -i 's/^#PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
             sed -i 's/^PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config
-            # 确保密码认证开启
             sed -i 's/^#PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
             sed -i 's/^PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
           "
 
-      # 10. 清理 rootfs 中的 QEMU 静态文件（减小体积）
-      - name: Clean up QEMU static binary
-        run: |
-          ROOTFS_DIR="${{ github.workspace }}/rootfs"
+          # 设置 root 密码（默认 "root"）
+          sudo chroot "$ROOTFS_DIR" /bin/bash -c "echo 'root:root' | chpasswd"
+
+          # 安装额外常用包（确保所有工具齐全）
+          sudo chroot "$ROOTFS_DIR" /bin/bash -c "
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              htop \
+              less \
+              man-db \
+              nano \
+              systemd-timesyncd \
+              network-manager
+            apt-get clean
+            rm -rf /var/lib/apt/lists/*
+          "
+
+          # 清理 QEMU 静态文件（减小体积）
           sudo rm -f "$ROOTFS_DIR/usr/bin/qemu-aarch64-static"
 
-      # 11. 打包 rootfs 为 tar 文件
+          # 卸载挂载
+          sudo umount "$ROOTFS_DIR/dev"
+          sudo umount "$ROOTFS_DIR/proc"
+          sudo umount "$ROOTFS_DIR/sys"
+
+      # 8. 打包 rootfs 为 tar.gz
       - name: Package rootfs
         run: |
           ROOTFS_DIR="${{ github.workspace }}/rootfs"
           sudo tar -C "$ROOTFS_DIR" -czf "${{ github.workspace }}/debian12-arm64-rootfs.tar.gz" .
 
-      # 12. 上传为 GitHub Actions 产物
+      # 9. 上传为 GitHub Actions 产物
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: debian12-arm64-rootfs
           path: ${{ github.workspace }}/debian12-arm64-rootfs.tar.gz
           retention-days: 7
+          
